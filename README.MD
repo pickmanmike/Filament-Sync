@@ -94,7 +94,7 @@ Use the advanced mode to set the id you picked as "Material Code" in the RFID fo
 
 #### Install Filament-Sync-Service on your printer
 
->[Filament-Sync-Service](https://github.com/HurricanePrint/Filament-Sync-Service)
+>[Filament-Sync-Service](https://github.com/pickmanmike/Filament-Sync-Service)
 
 
 ## Installation
