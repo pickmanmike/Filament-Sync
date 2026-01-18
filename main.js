@@ -1,12 +1,26 @@
-const addOptions = require('./tools/options-tool.js')
-const addProfiles = require ('./tools/database-tool.js')
-const {initData} = require('./tools/config.js')
-const sendToPrinter = require('./tools/scp.js')
+const { initData, readProfiles } = require('./tools/config.js');
+const database = require('./tools/database-tool.js');
+const options = require('./tools/options-tool.js');
+const sendToPrinter = require('./tools/scp.js');
 
-initData()
+// Entrypoint
+(async () => {
+  try {
+    initData();
 
-addOptions()
+    const profiles = readProfiles();
 
-addProfiles()
+    // Build the two files Creality actually consumes
+    await options.addToOptions(profiles);
+    await database.addToDatabase(profiles);
 
-sendToPrinter()
+    // Upload to printer (Creality Hi: no SFTP server, so we use pure SSH exec + cat)
+    await sendToPrinter();
+  } catch (err) {
+    console.error('\n[Filament-Sync] ERROR:', err?.message || err);
+    if (process.env.FILAMENT_SYNC_DEBUG) {
+      console.error(err);
+    }
+    process.exit(1);
+  }
+})();
