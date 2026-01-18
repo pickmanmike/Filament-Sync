@@ -22,11 +22,15 @@ This has only been tested with Windows so all instructions are for Windows. Unli
    - Includes `fix-creality-base-filaments.js` to build a full preset under:
      - `%APPDATA%\Creality\Creality Print\6.0\user\<USERID>\filament\base`
    - It merges the system preset referenced by `inherits` with your truncated custom preset.
+   - Works on Creality Hi devices where `sftp-server` is missing.
 
 3. **Notes handling**
    - Upstream Filament-Sync expects a JSON blob in `filament_notes` like:
      `{"id":"52341","vendor":"Acme","type":"PETG","name":"Acme PETG-CF"}`
    - This fork can optionally auto-generate that JSON if missing (see config).
+
+4. **Works with Creality Print 6 or Creality Print 7**
+   - If multiple Creality Print versions are installed (e.g. 6.0 and 7.0), this fork prefers `6.0` when locating your `...\Creality Print\<ver>\user\<USERID>\filament` folder.
 
 ## How the whole pipeline fits together
 
@@ -165,3 +169,30 @@ node main.js
 
 Windows users can also run the windows-sync.bat file 
 
+## Useful environment variables
+
+- `FILAMENT_SYNC_DEBUG=1` — verbose logs
+- `FILAMENT_SYNC_AUTO_NOTES=1` — auto-generate `filament_notes` if missing
+- `FILAMENT_SYNC_BACKUP=0` — disable local backups of remote files before upload
+
+## Safety and backups
+
+This tool ultimately modifies the printer’s material database. Before you iterate a lot, grab a backup:
+
+```sh
+cp -a /mnt/UDISK/creality/userdata/box/material_database.json \
+      /mnt/UDISK/creality/userdata/box/material_database.json.bak_$(date +%F-%H%M%S)
+cp -a /mnt/UDISK/creality/userdata/box/material_option.json \
+      /mnt/UDISK/creality/userdata/box/material_option.json.bak_$(date +%F-%H%M%S)
+```
+
+This fork also saves local backups under `./backups/<timestamp>/` by default.
+
+## License
+
+GPL-3.0
+
+## Credits
+
+All original credit goes to HurricanePrint for Filament-Sync and Filament-Sync-Service.
+This fork is just compatibility shims and a Creality Print workaround.
