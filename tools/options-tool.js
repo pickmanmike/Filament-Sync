@@ -1,81 +1,79 @@
-// Functions for material option
-const fs = require('fs')
-const path = require('path')
-const dirname = path.join(__dirname, '..', 'data/')
-const optionsFile = dirname + 'material_option.json'
-const {readProfiles} = require('./config')
+// Tools for material options (safe / idempotent version)
+const fs = require('fs');
+const path = require('path');
 
-const readOptions = () => {
-    let options = JSON.parse(fs.readFileSync(optionsFile))
-    return options
-}
+const dataDir = path.join(__dirname, '..', 'data');
+const optionsFile = path.join(dataDir, 'material_option.json');
+const { readProfiles } = require('./config');
 
-const writeOptions = (options) => {
-    fs.writeFileSync(optionsFile, JSON.stringify(options, null, "\t"), function (err) {
-        if (err) {
-            console.error('\nError creating options file')
-            console.error("Make sure directory isn't set read-only") 
-            console.error(err) 
-        }
-    })
-}
+// Optional debug logging: set FILAMENT_SYNC_DEBUG=1
+const DEBUG =
+  process.env.FILAMENT_SYNC_DEBUG === '1' ||
+  process.env.FILAMENT_SYNC_DEBUG === 'true';
 
-const addFilament = (vendor, type, name) => {
-    let item, filamentType
-    let options = readOptions()
+const dlog = (...args) => {
+  if (DEBUG) console.log('[Filament-Sync][opt]', ...args);
+};
 
-    for (item in options) {
-        materialOption = options
-        if (item == vendor) {
-            for (filamentType in options[item]) {
-                if (filamentType === type) {
-                    let newString = materialOption[item][filamentType]
-                    let word = name
-                    let index = newString.indexOf(word)
-                    if (index !== -1) {
-                        return
-                    } else {
-                        if (filamentType == type) {
-                            const oldValues = materialOption[vendor]
-                            const tempName = oldValues[type] + "\n" + [name]
-                            const newData = Object.assign({}, {
-                                [type]: tempName
-                            })
-                            let newOptions = Object.assign({}, materialOption[vendor], newData)
-                            materialOption[vendor] = newOptions
-                            writeOptions(materialOption)
-                            return
-                        }
-                    }
-                }
-            }
-            const oldValues = materialOption[vendor]
-            const newValues = {
-                [type]: name
-            }
-            const newData = Object.assign({}, oldValues, newValues)
-            materialOption[vendor] = newData
-            writeOptions(materialOption)
-            return
-        }
-    }
-    const newVendor = new Object({
-        [vendor]: {
-            [type]: name
-        }
-    })
-    const newData = Object.assign({}, materialOption, newVendor)
-    materialOption = newData
-    writeOptions(materialOption)
-}
+const readJson = (filePath) => {
+  const raw = fs.readFileSync(filePath, 'utf8');
+  return JSON.parse(raw);
+};
+
+const writeJson = (filePath, obj) => {
+  fs.writeFileSync(filePath, JSON.stringify(obj, null, '\t'));
+};
+
+const parseNotes = (profile) => {
+  const n = profile?.filament_notes;
+  const s = Array.isArray(n) ? String(n[0] ?? '') : String(n ?? '');
+
+  const trimmed = s.trim();
+  if (!trimmed || trimmed === '""') return null;
+
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return null;
+  }
+};
+
+const addNameToBucket = (bucketStr, name) => {
+  const lines = String(bucketStr || '')
+    .split('\n')
+    .map((x) => x.trim())
+    .filter(Boolean);
+
+  if (!lines.includes(name)) lines.push(name);
+  return lines.join('\n');
+};
 
 const addOptions = () => {
-    let customProfiles = readProfiles()
-    for (item in customProfiles) {
-        let curItem = customProfiles[item]
-        let curItemData = JSON.parse(curItem.filament_notes)
-        addFilament(curItemData.vendor, curItemData.type, curItemData.name)
-    }
-}
+  if (!fs.existsSync(optionsFile)) {
+    throw new Error(`material_option.json not found: ${optionsFile}\nRun initData first.`);
+  }
 
-module.exports = addOptions
+  const opts = readJson(optionsFile) || {};
+  const presets = readProfiles();
+
+  let added = 0;
+
+  for (const p of presets) {
+    const notes = parseNotes(p);
+    if (!notes) continue;
+
+    const vendor = String(notes.vendor || '').trim();
+    const type = String(notes.type || '').trim();
+    const name = String(notes.name || '').trim();
+    if (!vendor || !type || !name) continue;
+
+    if (!opts[vendor] || typeof opts[vendor] !== 'object') opts[vendor] = {};
+    opts[vendor][type] = addNameToBucket(opts[vendor][type], name);
+    added += 1;
+  }
+
+  writeJson(optionsFile, opts);
+  dlog(`Processed ${added} note entries into material_option.json`);
+};
+
+module.exports = addOptions;

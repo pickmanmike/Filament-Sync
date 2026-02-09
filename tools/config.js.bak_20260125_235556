@@ -38,7 +38,7 @@ const isDir = (p) => {
   }
 };
 
-// Prefer /filament/base when present (author's intent), but some builds store
+// Prefer /filament/base when present (authorâ€™s intent), but some builds store
 // custom presets directly under /filament. Fall back gracefully.
 const resolveCustomFilamentDir = (filamentRootDir) => {
   const baseDir = path.join(filamentRootDir, 'base');
@@ -104,18 +104,10 @@ const normalizeCrealityProfile = (profile) => {
 
 const checkCrealityFormatting = (profiles) => profiles.map(normalizeCrealityProfile);
 
-// Choose a Creality Print version folder.
-// Priority:
-//   1) CREALITY_PRINT_VERSION override (exact match)
-//   2) Version that appears to contain your presets (base folder count, then root count)
-//   3) Highest numeric version
+// Try "6.0" first (as documented), otherwise pick highest numeric version folder if present.
 const pickCrealityVersionDir = (crealityPrintBaseDir) => {
-  const override = String(process.env.CREALITY_PRINT_VERSION || '').trim();
-  if (override) {
-    const cand = path.join(crealityPrintBaseDir, override);
-    if (isDir(cand)) return cand;
-    console.warn('[Filament-Sync] CREALITY_PRINT_VERSION=' + override + ' not found under ' + crealityPrintBaseDir + '; falling back to autodetect.');
-  }
+  const preferred = path.join(crealityPrintBaseDir, '6.0');
+  if (isDir(preferred)) return preferred;
 
   if (!isDir(crealityPrintBaseDir)) return null;
 
@@ -127,48 +119,19 @@ const pickCrealityVersionDir = (crealityPrintBaseDir) => {
   const versionDirs = entries.filter((n) => /^\d+(\.\d+)*$/.test(n));
   if (!versionDirs.length) return null;
 
-  const userId = String(USERID || '').trim();
-
-  const countJson = (dir) => {
-    try {
-      return fs.readdirSync(dir).filter((n) => n.toLowerCase().endsWith('.json')).length;
-    } catch (_) {
-      return 0;
-    }
-  };
-
-  const numericDesc = (a, b) => {
+  versionDirs.sort((a, b) => {
     const pa = a.split('.').map(Number);
     const pb = b.split('.').map(Number);
     const len = Math.max(pa.length, pb.length);
     for (let i = 0; i < len; i++) {
       const da = pa[i] || 0;
       const db = pb[i] || 0;
-      if (da !== db) return db - da;
+      if (da !== db) return db - da; // descending
     }
     return 0;
-  };
-
-  // Score each version by how many presets exist for this USERID.
-  // base folder count is weighted more heavily because Filament-Sync prefers base presets.
-  const scored = versionDirs.map((v) => {
-    if (!userId) return { v, baseCount: 0, rootCount: 0 };
-    const filamentDir = path.join(crealityPrintBaseDir, v, 'user', userId, 'filament');
-    const baseDir = path.join(filamentDir, 'base');
-    return {
-      v,
-      baseCount: countJson(baseDir),
-      rootCount: countJson(filamentDir),
-    };
   });
 
-  scored.sort((a, b) => {
-    if (a.baseCount !== b.baseCount) return b.baseCount - a.baseCount;
-    if (a.rootCount !== b.rootCount) return b.rootCount - a.rootCount;
-    return numericDesc(a.v, b.v);
-  });
-
-  return path.join(crealityPrintBaseDir, scored[0].v);
+  return path.join(crealityPrintBaseDir, versionDirs[0]);
 };
 
 const getFilamentRootDir = ({ osType, homeDir, slicer, userId }) => {
@@ -322,7 +285,7 @@ const initData = () => {
   filterProfiles();
 };
 
-// Keep the old "sendToPrinter" name alive no matter what main.js imports.
+// Keep the old â€œsendToPrinterâ€ name alive no matter what main.js imports.
 const sendToPrinter = async () => {
   if (typeof sendToPrinterFromScp === 'function') return sendToPrinterFromScp();
   return sendFiles();

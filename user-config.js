@@ -1,28 +1,27 @@
-const PRINTERIP = '10.0.0.215'
+/**
+ * user-config.js — local configuration for Filament-Sync
+ *
+ * NOTE:
+ * - Creality Hi commonly ships with SSH user 'root' and password 'Creality2024'
+ * - USERID is the folder name under:
+ *     %APPDATA%\Creality\Creality Print\<version>\user\<USERID>\
+ */
+
+const USERID = 'default'            // e.g. '6124739093' (Creality account numeric ID), or 'default'
+const SLICER = 'creality'           // 'creality' or 'orca'
+const PRINTERIP = '192.168.1.100'   // your printer IP on the LAN
 const USER = 'root'
-const PASSWORD = 'creality_2024'
+const PASSWORD = 'Creality2024'
 
+// Creality Hi staging directory that this fork uploads to
+// (printer-side service copies these into /mnt/UDISK/creality/userdata/box/)
+const REMOTE_DIR = '/usr/share/Filament-Sync'
 
-// Enter the slicer you want to sync from 
-// 'orca' or 'creality'
-const SLICER = 'orca'
-
-/*
-Users logged into the slicer will need to specify their unique user folder id
-replace default below with the id from:
-
-OrcaSlicer
-    Mac: /Library/Application Support/OrcaSlicer/user/USERID#
-    Linux: /.config/OrcaSlicerOrcaSlicer/user/USERID#
-    Windows: /AppData/Roaming/OrcaSlicer/user/USERID#
-
-CrealityPrint
-    Mac: /Library/Application Support/Creality/Creality Print/6.0/user/USERID#
-    Linux: /.config/Creality/Creality Print/6.0/user/USERID#
-    Windows: /AppData/Roaming/Creality/Creality Print/6.0/user/USERID#
-
-Not logged in: 'default'
-*/
-const USERID = 'default'
-
-module.exports = {PRINTERIP, USER, PASSWORD, SLICER, USERID}
+module.exports = {
+  USERID,
+  SLICER,
+  PRINTERIP,
+  USER,
+  PASSWORD,
+  REMOTE_DIR,
+}
