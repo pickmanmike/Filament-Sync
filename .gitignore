@@ -1,4 +1,6 @@
-.DS_Store
-/node_modules
-/data
-/temp
+# Filament-Sync generated backups / diagnostics
+tools/*.bak_*
+tools/sourcedata/
+backups/
+data/material_database.json
+data/material_option.json
