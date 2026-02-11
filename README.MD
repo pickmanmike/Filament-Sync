@@ -196,12 +196,10 @@ This fork also saves local backups under `./backups/<timestamp>/` by default.
 
 ## License
 
-GPL-3.0 (same as upstream)
+GPL-3.0
 
 ---
 
 ## Credits
 
 All original credit goes to **HurricanePrint** for Filament-Sync and Filament-Sync-Service.
-
-This fork’s goal is compatibility with Creality Hi + Dropbear + modern Creality Print.
