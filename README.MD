@@ -1,162 +1,207 @@
-## Donations
-[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/P5P11AL9ZR)
+# Filament-Sync (Creality Hi / Dropbear + Creality Print 6 & 7 fork)
 
+This is a fork of HurricanePrint’s **Filament-Sync** that’s been adapted to work with **Creality Hi** firmware and modern **Creality Print 6 / 7** builds on **Windows**.
 
-# Filament Sync 
+The big pain points this fork addresses:
 
-This tool reads custom filament profiles from Orcaslicer and Creality Print, converts them to Creality's database format and then sends them to the printer to pick manually with the screen or automatically with custom RFID tags
+- Many OpenWrt/Tina-based Creality firmwares ship with **Dropbear SSH**, but **do not provide an SFTP subsystem**, so upstream SFTP-based uploads can fail.
+- Recent Creality Print builds sometimes create **“truncated” custom filament presets** that never show up in `filament\base`, which upstream Filament-Sync expects.
+- If you have **multiple PCs** syncing to the same printer, you can accidentally overwrite each other unless you start from the printer’s current DB.
 
-Creality has recently added syncing of your filaments with Creality Print in the latest K2 firmware, but this comes with some caveats. It will put all of your profiles under the "Generic" brand and does not allow the use of custom RFID tags. 
+This fork adds:
+- a Dropbear-friendly uploader (`tools/scp.js`) that uses **SSH exec + stream → temp → mv** (atomic write)
+- a base preset “expander” (`fix-creality-base-filaments.js`) to build full presets under `...\filament\base\`
+- an optional diagnostic pull script (`pull-printer-sourcedata.js`) to pull the on-printer DB/OPT locally
+- improved Windows wrappers (`windows-sync.bat`, plus optional helpers)
 
-My tool will categorize your profiles under the correct brand name, filament type, and a more readable name. It also allows automatic assigning when using custom RFID tags with the CFS and side spool. Using custom RFID tags will also enable tracking filament usage and showing remaining amount on the filament selection screen.
+> **Test status:** So far this has only been tested on **Windows 10/11**, **Creality Hi**, and **Creality Print 6.x + 7.x**.
 
-### Add required info to your profiles
+---
 
-You will need to add this into the Notes section of the filament
+## How the pipeline works
 
-```
-{"id":"","vendor":"","type":"","name":""}
-```
+### On your PC (Creality Print)
 
-The "id" should be a unique 5 digit value that you will also match with your custom RFID tags if you are using them
+Creality Print stores your custom filament presets under:
 
-You can ⌘/CTRL-F in the material_database.json to make sure the id you pick isn't already being used
+`%APPDATA%\Creality\Creality Print\<version>\user\<USERID>\filament\`
 
-An id is still required even if you are not using RFID tags as the tool searches by id when updating filament settings
+Recent Creality Print builds can sometimes write a short “wrapper” preset there (with `inherits` / `base_id`), but fail to create the fully-expanded preset in:
 
-Here is an example
+`...\filament\base\`
 
-```
-{"id":"02345","vendor":"ELEGOO","type":"PLA","name":"Fast PLA"}
-```
+This fork’s `fix-creality-base-filaments.js` merges the referenced **system preset** with your custom preset and writes the expanded JSON into the `base` folder.
 
-### If you are using custom RFID tags
-Set the "Material Code" to the id that you set in the profile.
-In the RFID for CFS app, turn on advanced mode to enable setting custom codes
+### On the printer (Creality Hi)
+
+This fork uploads:
+
+- `data/material_database.json`
+- `data/material_option.json`
+
+to a **staging path** on the printer:
+
+`/usr/share/Filament-Sync/`
+
+A printer-side service then copies these files into Creality’s live DB location:
+
+`/mnt/UDISK/creality/userdata/box/`
+
+On Creality Hi, that copy usually happens within ~15–30 seconds.
+
+---
 
 ## Prerequisites
 
-#### Install Node.js
+1. **Node.js LTS** installed on your PC (and available in `PATH`)
+2. **Git** (optional but strongly recommended)
+3. Creality Print **6.x and/or 7.x**
+4. SSH access to the printer (Creality Hi default is typically: `root / Creality2024`)
 
->[Download Node.js](https://nodejs.org/en)
+---
 
-## Installation
+## Install
 
-#### Download Filament-Sync
-
-[Latest release](https://github.com/hurricaneprint/Filament-Sync/releases/latest)
-
-Extract the folder on your computer
-
-#### If you haven't already connected to your printer with SSH, use terminal or powershell to connect and generate the RSA keys needed for the script to run correctly
-
-```
-ssh root@your-printer-ip
+```powershell
+cd $env:USERPROFILE
+git clone https://github.com/pickmanmike/Filament-Sync.git
+cd Filament-Sync
+npm install
 ```
 
-## Config
+---
 
-Open the **user-config.js** file with a text editor
+## Configure
 
-Change **PRINTERIP** to the ip of your printer
+Edit `user-config.js`:
 
-```
-const PRINTERIP = '127.0.0.1'
-const USER = 'root'
-const PASSWORD = 'creality_2024'
-```
-If you have changed your username or password they can also be updated here
+- `PRINTERIP` = your printer IP on the LAN
+- `USER` / `PASSWORD` = printer SSH credentials
+- `SLICER` = `creality`
+- `USERID` = the folder name inside Creality Print’s `...\user\` directory (often a numeric ID)
 
-Change **SLICER** to select the slicer you want to sync from 
+---
 
-* Enter 'orca' or 'creality'
+## Create a custom filament preset (Creality Print)
 
-```
-const SLICER = 'orca'
-```
+Creality Print UI can be weird here.
 
-If you are using logged into an account in OrcaSlicer or CrealityPrint, change **USERID** to the unique id number that the slicer has set for the user folder.
+The most reliable workflow (as of CP 6/7 + Hi firmware):
 
-```
-const USERID = 'default'
-```
+1. Select a spool/CFS slot
+2. Choose **Edit** on a generic profile
+3. Save as a custom filament
 
-You can find your user id by clicking the **Help** tab in your slicer and then clicking **Show Configuration Folder**
+Then add this JSON blob into the filament **Notes** field:
 
-OrcaSlicer
-
-    Mac: /Library/Application Support/OrcaSlicer/user/USERID#
-    Linux: /.config/OrcaSlicerOrcaSlicer/user/USERID#
-    Flatpak: /.var/app/io.github.softfever.OrcaSlicer/config/OrcaSlicer/user/
-    Windows: /AppData/Roaming/OrcaSlicer/user/USERID#
-
-CrealityPrint
-
-    Mac: /Library/Application Support/Creality/Creality Print/7.0/user/USERID#
-    Linux: /.config/Creality/Creality Print/7.0/user/USERID#
-    Flatpak: /.var/app/io.github.crealityofficial.CrealityPrint/config/Creality/Creality Print/7.0/user/
-    Windows: /AppData/Roaming/Creality/Creality Print/7.0/user/USERID#
-
-## Set to run as post-processing script in slicer
-
-This will sync everytime you slice and export gcode to the printer
-
-You may encounter an error the first time it runs the script. This is normal as the service is being installed to the printer and sometimes the slicer loses its connection. It should work normally every time after this.
-
-At the bottom of the "**Others**" tab of your slicing settings, find "**Post-processing Scripts**" 
-
-Make sure to change the path to where you put the extracted Filament-Sync folder
-
-### Mac 
-
-```
-/usr/local/bin/node /Users/your-user-name/Filament-Sync/main.js;
+```json
+{"id":"50434","vendor":"Tinmorry","type":"PETG","name":"PETG-CF Tinmorry"}
 ```
 
-### Linux
+- `id` must be unique (often 5 digits)
+- `vendor` becomes the “Brand” shown on the printer
+- `type` should match Creality’s type buckets (PLA, PETG, ABS, etc.)
+- `name` is the display name
 
-```
-/usr/local/bin/node /home/your-user-name/Filament-Sync/main.js;
-```
+---
 
-#### Windows
+## Run (manual)
 
-```
-C:\Users\your-user-name\Filament-Sync\windows-sync.bat;
-```
+### Creality Print 7.x
 
-### To sync manually
-
-In Terminal/Powershell enter the Filament-Sync folder
-then run
-```
-node main.js
+```powershell
+cd $env:USERPROFILE\Filament-Sync
+$env:CREALITY_PRINT_VERSION = "7.0"
+$env:FILAMENT_SYNC_DEBUG = "1"
+.\windows-sync.bat
 ```
 
-Windows users can also run the windows-sync.bat file 
+### Creality Print 6.x
 
-### Creating custom filament presets(Recommended, but no longer required)
+```powershell
+cd $env:USERPROFILE\Filament-Sync
+$env:CREALITY_PRINT_VERSION = "6.0"
+.\windows-sync.bat
+```
 
-If you want to get your presets ready just copy your settings into a new custom filament profile
+---
 
-Right side of the Filament section 
+## Run as a post-processing script (Creality Print)
 
-Click "**Set filaments to use**" icon
+In Creality Print slicing settings:
 
-Click "**Custom Filament**" at the top then click "**Create New**"
+**Others → Post-processing Scripts**
 
-If you don't see this option on Creality Print, go into the options/preferences and set **User Role** to **Professional**
+Add:
 
-Select "**Copy Current Filament Preset**" and choose a generic profile 
+```
+C:\Users\<you>\Filament-Sync\windows-sync.bat;
+```
+
+If you use CP 7, set `CREALITY_PRINT_VERSION=7.0` in your environment or use the `windows-sync-cp7.bat` helper (optional).
+
+---
+
+## Multi-PC setups (recommended)
+
+If two computers can sync to the same printer, always start from the printer’s current DB to avoid “last writer wins” clobbering.
+
+This fork’s default `windows-sync.bat` does:
+
+1. `pull-printer-sourcedata.js` (pull printer DB/OPT locally)
+2. `fix-creality-base-filaments.js` (expand base presets, *skip unless stale*)
+3. `main.js` (merge + upload)
+
+---
+
+## Environment variables
+
+- `CREALITY_PRINT_VERSION=6.0|7.0` — force a Creality Print version folder
+- `FILAMENT_SYNC_DEBUG=1` — verbose logs
+- `FILAMENT_SYNC_AUTO_NOTES=1` — auto-generate `filament_notes` if missing
+- `FILAMENT_SYNC_BACKUP=0` — disable local backups of remote files before upload
+
+---
+
+## Safety and backups
+
+This tool ultimately modifies the printer’s material DB.
+
+Before iterating a lot, take backups on the printer:
+
+```sh
+cp -a /mnt/UDISK/creality/userdata/box/material_database.json \
+      /mnt/UDISK/creality/userdata/box/material_database.json.bak_$(date +%F-%H%M%S)
+cp -a /mnt/UDISK/creality/userdata/box/material_option.json \
+      /mnt/UDISK/creality/userdata/box/material_option.json.bak_$(date +%F-%H%M%S)
+```
+
+This fork also saves local backups under `./backups/<timestamp>/` by default.
+
+---
 
 ## Troubleshooting
 
-### If the printer fails to start prints and shows a EEPROM_DEBUG error
+### “No profiles found in the selected custom profile directory”
+- Make sure you set `CREALITY_PRINT_VERSION` correctly (6 vs 7)
+- Make sure `fix-creality-base-filaments.js` created at least one file in `...\filament\base`
+- Confirm your preset contains `filament_notes` (or enable `FILAMENT_SYNC_AUTO_NOTES=1`)
 
-Go into the folder where your presets are stored and make sure that the preset json files show all of the filament settings and not just a short list of the ones that you edited. If the custom profile wasn't created correctly it won't show all of the settings. The full list should be around 300 lines.
+### “Uploads work, but the printer UI doesn’t show my filament”
+- Wait ~30 seconds (printer-side copy)
+- Power-cycle the printer UI (worst case: reboot printer)
+- Confirm the live DB contains your ID in `/mnt/UDISK/creality/userdata/box/material_database.json`
 
-### If running as post-processing script and it isn't syncing correctly
+---
 
-Run the script manually in the terminal and refer to the error messages in the console to see what needs to be fixed.
+## License
 
-If the error fix isn't described, create a [New Issue](https://github.com/HurricanePrint/Filament-Sync/issues/new/choose) and copy & paste the terminal output. 
+GPL-3.0 (same as upstream)
+
+---
+
+## Credits
+
+All original credit goes to **HurricanePrint** for Filament-Sync and Filament-Sync-Service.
+
+This fork’s goal is compatibility with Creality Hi + Dropbear + modern Creality Print.
