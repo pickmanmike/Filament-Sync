@@ -2,405 +2,283 @@
 /**
  * fix-creality-base-filaments.js
  *
- * Purpose:
- *   Creality Print sometimes stores "custom" filament presets as *truncated* JSON files
- *   (only the settings you changed). Filament-Sync expects the *full* preset (hundreds
- *   of lines / lots of keys). This script expands those truncated presets by merging:
+ * Creality Print sometimes writes "truncated" custom filament presets into:
+ *   %APPDATA%\Creality\Creality Print\<ver>\user\<USERID>\filament\
+ * ...but fails to generate the expanded preset under:
+ *   ...\filament\base\
  *
- *     root template (e.g. fdm_filament_petg)
- *        + the chosen system preset (e.g. "Generic PETG @Creality Hi 0.4 nozzle")
- *        + your truncated user preset (e.g. "PETG-CF ExampleBrand")
+ * Filament-Sync reads full presets from the `base` folder. This helper:
+ *   - reads each user preset in `filament\`
+ *   - finds the referenced system preset (via `base_id` or `inherits`)
+ *   - deep-merges system + user preset
+ *   - writes the merged file into `filament\base\`
  *
- *   Output is written to:
- *     .../Creality Print/<version>/user/<USERID>/filament/base/<preset>.json
+ * New behavior (fork): **skip unless stale**.
+ * We rebuild an output file only when:
+ *   - it doesn't exist, OR
+ *   - it looks broken (too small / too few keys), OR
+ *   - the user preset or system preset is newer than the output, OR
+ *   - --force is set
  *
- * Behavior:
- *   - Prefers Creality Print 6.0 first (per repo README) but will also process 7.0
- *     (and any other numeric version folders it finds) if present.
- *   - Does NOT modify your original presets by default.
- *   - Skips output files that already exist unless you pass --force.
- *
- * Run:
+ * Usage:
  *   node fix-creality-base-filaments.js
+ *   node fix-creality-base-filaments.js --version 7.0
  *   node fix-creality-base-filaments.js --force
  */
 
-const fs = require("fs");
-const path = require("path");
-const os = require("os");
+'use strict'
 
-// --- Load user-config.js (best effort) ---
-let USERID = "default";
-try {
-  const cfg = require("./user-config");
-  if (cfg && typeof cfg.USERID !== "undefined") USERID = String(cfg.USERID);
-} catch (e) {
-  // If user-config.js isn't present or doesn't export USERID, we fall back to 'default'
+const fs = require('fs')
+const path = require('path')
+
+const cfg = require('./user-config')
+
+const FORCE = process.argv.includes('--force') || process.argv.includes('-f') || process.env.FILAMENT_SYNC_FORCE_BASE === '1'
+const DRY_RUN = process.argv.includes('--dry-run') || process.env.FILAMENT_SYNC_DRY_RUN === '1'
+const VERBOSE = process.env.FILAMENT_SYNC_DEBUG === '1' || process.argv.includes('--verbose')
+
+function argValue(flag) {
+  const idx = process.argv.indexOf(flag)
+  if (idx >= 0 && idx + 1 < process.argv.length) return process.argv[idx + 1]
+  return null
 }
 
-// --- CLI flags ---
-const argv = process.argv.slice(2);
-const FORCE = argv.includes("--force");
+const ONLY_VERSION = argValue('--version') || process.env.CREALITY_PRINT_VERSION || null
 
-// --- Paths ---
-const APPDATA =
-  process.env.APPDATA ||
-  path.join(os.homedir(), "AppData", "Roaming"); // Windows fallback
+function log(msg) { console.log(`[base-fix] ${msg}`) }
+function warn(msg) { console.warn(`[base-fix] WARN: ${msg}`) }
 
-const CREALITY_ROOT = path.join(APPDATA, "Creality", "Creality Print");
+function fileExists(p) {
+  try { fs.accessSync(p); return true } catch (_) { return false }
+}
 
-// --- Helpers ---
-function isDir(p) {
-  try {
-    return fs.statSync(p).isDirectory();
-  } catch {
-    return false;
+function safeReadJson(p) {
+  try { return JSON.parse(fs.readFileSync(p, 'utf8')) } catch (e) { return null }
+}
+
+function deepMerge(target, source) {
+  // Merge objects recursively, arrays replaced (not concatenated).
+  if (source === null || source === undefined) return target
+  if (typeof source !== 'object') return source
+  if (Array.isArray(source)) return source.slice()
+
+  const out = (target && typeof target === 'object' && !Array.isArray(target)) ? Object.assign({}, target) : {}
+  for (const k of Object.keys(source)) {
+    const sv = source[k]
+    const tv = out[k]
+    if (sv && typeof sv === 'object' && !Array.isArray(sv)) {
+      out[k] = deepMerge(tv, sv)
+    } else if (Array.isArray(sv)) {
+      out[k] = sv.slice()
+    } else {
+      out[k] = sv
+    }
   }
+  return out
 }
 
-function isFile(p) {
-  try {
-    return fs.statSync(p).isFile();
-  } catch {
-    return false;
+function countTopKeys(obj) {
+  if (!obj || typeof obj !== 'object') return 0
+  return Object.keys(obj).length
+}
+
+function findFilesByBasename(rootDir, baseName) {
+  const results = []
+  function walk(dir) {
+    let entries = []
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }) } catch (_) { return }
+    for (const ent of entries) {
+      const p = path.join(dir, ent.name)
+      if (ent.isDirectory()) walk(p)
+      else if (ent.isFile() && ent.name.toLowerCase() === `${baseName.toLowerCase()}.json`) results.push(p)
+    }
   }
+  walk(rootDir)
+  return results
 }
 
-function listVersionDirs() {
-  if (!isDir(CREALITY_ROOT)) return [];
-  const entries = fs.readdirSync(CREALITY_ROOT, { withFileTypes: true });
+function findSystemPreset(systemDir, userPreset) {
+  const candidates = [userPreset && userPreset.base_id, userPreset && userPreset.inherits].filter(Boolean)
+  for (const id of candidates) {
+    const matches = findFilesByBasename(systemDir, id)
+    if (matches.length === 1) return matches[0]
+    if (matches.length > 1) {
+      warn(`Multiple system presets match '${id}' under ${systemDir}. Using first: ${matches[0]}`)
+      return matches[0]
+    }
+  }
+  return null
+}
+
+function listInstalledCrealityVersions(crealityRoot) {
+  let entries = []
+  try { entries = fs.readdirSync(crealityRoot, { withFileTypes: true }) } catch (_) { return [] }
   return entries
-    .filter((e) => e.isDirectory() && /^[0-9]+\.[0-9]+$/.test(e.name))
-    .map((e) => e.name);
+    .filter(e => e.isDirectory())
+    .map(e => e.name)
+    .filter(name => /^\d+\.\d+/.test(name))
+    .sort((a,b) => a.localeCompare(b, undefined, { numeric: true }))
 }
 
-function sortVersionsPrefer60First(versions) {
-  const preferred = ["6.0", "7.0"];
-  const out = [];
-  const set = new Set(versions);
+function shouldRebuild(outPath, srcPath, sysPath) {
+  if (FORCE) return true
+  if (!fileExists(outPath)) return true
 
-  // Pull preferred versions first, in order, if present
-  for (const v of preferred) {
-    if (set.has(v)) out.push(v);
+  const outStat = fs.statSync(outPath)
+  if (outStat.size < 1500) return true // too small: likely truncated
+
+  // If the output JSON is too "short", treat as broken.
+  const outJson = safeReadJson(outPath)
+  if (!outJson) return true
+  const keyCount = countTopKeys(outJson)
+  if (keyCount < 50) return true
+
+  const srcStat = fs.statSync(srcPath)
+  const sysStat = sysPath && fileExists(sysPath) ? fs.statSync(sysPath) : null
+
+  const newestInput = Math.max(srcStat.mtimeMs, sysStat ? sysStat.mtimeMs : 0)
+  if (outStat.mtimeMs + 1000 < newestInput) return true // small clock skew cushion
+
+  return false
+}
+
+function buildForVersion(crealityRoot, version) {
+  const userId = cfg.USERID || 'default'
+  const userFilamentDir = path.join(crealityRoot, version, 'user', userId, 'filament')
+  const baseDir = path.join(userFilamentDir, 'base')
+  const systemDir = path.join(crealityRoot, version, 'system')
+
+  log(`Using Creality Print version: ${version}`)
+  log(`Source filament dir: ${userFilamentDir}`)
+  log(`Output base dir: ${baseDir}`)
+  log(`System dir: ${systemDir}`)
+
+  if (!fileExists(userFilamentDir)) {
+    warn(`Missing filament dir for ${version}: ${userFilamentDir}`)
+    return { built: 0, skipped: 0, warnings: 1 }
   }
 
-  // Then everything else sorted numerically
-  const rest = versions
-    .filter((v) => !out.includes(v))
-    .sort((a, b) => parseFloat(a) - parseFloat(b));
+  // user presets are top-level .json files in `filament\` (not inside base/)
+  let presetFiles = []
+  try {
+    presetFiles = fs.readdirSync(userFilamentDir)
+      .filter(n => n.toLowerCase().endsWith('.json'))
+      .map(n => path.join(userFilamentDir, n))
+      .filter(p => !p.toLowerCase().includes(`${path.sep}base${path.sep}`))
+  } catch (_) {}
 
-  return out.concat(rest);
-}
-
-// Keys we want to keep as *strings* when present.
-// Everything else is converted to an array form: ["value"].
-const STRING_KEYS = new Set([
-  "type",
-  "name",
-  "from",
-  "instantiation",
-  "inherits",
-  "filament_id",
-  "setting_id",
-  "base_id",
-  "version",
-  "is_custom_defined",
-]);
-
-function normalizePresetValues(preset) {
-  const out = {};
-  for (const [k, v] of Object.entries(preset || {})) {
-    if (v === undefined) continue;
-
-    if (Array.isArray(v)) {
-      out[k] = v;
-      continue;
-    }
-
-    // Keep known metadata keys as strings
-    if (STRING_KEYS.has(k)) {
-      out[k] = String(v);
-      continue;
-    }
-
-    // Everything else becomes a one-element array of strings
-    out[k] = [String(v)];
-  }
-  return out;
-}
-
-function readJson(p) {
-  const txt = fs.readFileSync(p, "utf8");
-  return JSON.parse(txt);
-}
-
-/**
- * Try to locate a system preset JSON file by name.
- * We first try common expected locations, then fall back to a limited recursive search.
- */
-function findSystemPresetPathByName(name, systemRoot) {
-  if (!name || typeof name !== "string") return null;
-
-  const filename = `${name}.json`;
-
-  const candidates = [
-    path.join(systemRoot, "Creality", "filament", filename),
-    path.join(systemRoot, "Custom", "filament", filename),
-    path.join(systemRoot, "filament", filename),
-    path.join(systemRoot, "Creality", filename),
-    path.join(systemRoot, "Custom", filename),
-    path.join(systemRoot, filename),
-  ];
-
-  for (const p of candidates) {
-    if (isFile(p)) return p;
+  if (!presetFiles.length) {
+    log(`No .json presets found in ${userFilamentDir}`)
+    return { built: 0, skipped: 0, warnings: 0 }
   }
 
-  // Fallback: limited recursive search (depth-limited)
-  const maxDepth = 5;
-  const queue = [{ dir: systemRoot, depth: 0 }];
+  fs.mkdirSync(baseDir, { recursive: true })
 
-  while (queue.length) {
-    const { dir, depth } = queue.shift();
-    if (depth > maxDepth) continue;
+  let built = 0
+  let skipped = 0
+  let warnings = 0
 
-    let entries = [];
-    try {
-      entries = fs.readdirSync(dir, { withFileTypes: true });
-    } catch {
-      continue;
+  for (const presetPath of presetFiles) {
+    const userPreset = safeReadJson(presetPath)
+    if (!userPreset) {
+      warn(`Failed to parse JSON: ${presetPath}`)
+      warnings++
+      continue
     }
 
-    for (const e of entries) {
-      const full = path.join(dir, e.name);
-      if (e.isFile() && e.name === filename) return full;
-      if (e.isDirectory()) queue.push({ dir: full, depth: depth + 1 });
+    const sysPath = findSystemPreset(systemDir, userPreset)
+    if (!sysPath) {
+      warn(`No system preset found for ${path.basename(presetPath)} (base_id=${userPreset.base_id || ''}, inherits=${userPreset.inherits || ''})`)
+      warnings++
+      continue
     }
+
+    const outPath = path.join(baseDir, path.basename(presetPath))
+
+    if (!shouldRebuild(outPath, presetPath, sysPath)) {
+      if (VERBOSE) log(`SKIP (fresh): ${path.basename(outPath)}`)
+      skipped++
+      continue
+    }
+
+    const sysPreset = safeReadJson(sysPath)
+    if (!sysPreset) {
+      warn(`Failed to parse system preset JSON: ${sysPath}`)
+      warnings++
+      continue
+    }
+
+    const merged = deepMerge(sysPreset, userPreset)
+
+    // Preserve filename as name if it looks helpful and no explicit name was provided.
+    if (!merged.name) {
+      merged.name = path.basename(outPath, '.json')
+    }
+
+    const jsonText = JSON.stringify(merged, null, 2)
+
+    if (DRY_RUN) {
+      log(`DRY-RUN: would write ${path.basename(outPath)} (${countTopKeys(merged)} keys)`)
+      built++
+      continue
+    }
+
+    fs.writeFileSync(outPath, jsonText, 'utf8')
+
+    // If we rebuilt, align mtime to "now" so stale detection makes sense.
+    try { fs.utimesSync(outPath, new Date(), new Date()) } catch (_) {}
+
+    log(`WROTE: ${path.basename(outPath)} (${countTopKeys(merged)} keys)`)
+    built++
   }
 
-  return null;
+  log(`Done for ${version}. Built ${built}; skipped ${skipped}; warnings ${warnings}.`)
+  return { built, skipped, warnings }
 }
 
-function sanitizeFilename(name) {
-  // Keep it conservative for Windows filenames
-  return name.replace(/[<>:"/\\|?*\x00-\x1F]/g, "_").trim();
-}
-
-function countKeys(obj) {
-  return obj ? Object.keys(obj).length : 0;
-}
-
-// --- Main per-version processing ---
-function processCrealityVersion(version) {
-  const versionRoot = path.join(CREALITY_ROOT, version);
-  const userFilamentDir = path.join(versionRoot, "user", USERID, "filament");
-  const baseOutDir = path.join(userFilamentDir, "base");
-  const systemRoot = path.join(versionRoot, "system");
-
-  console.log(`[base-fix] Using Creality Print version: ${version}`);
-  console.log(`[base-fix] Source filament dir: ${userFilamentDir}`);
-  console.log(`[base-fix] Output base dir: ${baseOutDir}`);
-  console.log(`[base-fix] System dir: ${systemRoot}`);
-
-  if (!isDir(userFilamentDir)) {
-    console.log(
-      `[base-fix] SKIP: filament directory not found for USERID=${USERID}\n`
-    );
-    return { built: 0, skipped: 0, warnings: 0 };
+function main() {
+  // Find Creality Print root
+  const appData = process.env.APPDATA
+  if (!appData) {
+    throw new Error('APPDATA is not set. This script currently expects Windows (APPDATA).')
   }
-  if (!isDir(systemRoot)) {
-    console.log(`[base-fix] SKIP: system directory not found\n`);
-    return { built: 0, skipped: 0, warnings: 0 };
+  const crealityRoot = path.join(appData, 'Creality', 'Creality Print')
+
+  const versions = listInstalledCrealityVersions(crealityRoot)
+  if (!versions.length) {
+    throw new Error(`No Creality Print version folders found under: ${crealityRoot}`)
   }
 
-  fs.mkdirSync(baseOutDir, { recursive: true });
-
-  const entries = fs.readdirSync(userFilamentDir, { withFileTypes: true });
-  const jsonFiles = entries
-    .filter((e) => e.isFile() && e.name.toLowerCase().endsWith(".json"))
-    .map((e) => e.name);
-
-  if (jsonFiles.length === 0) {
-    console.log(`[base-fix] No .json presets found in ${userFilamentDir}\n`);
-    return { built: 0, skipped: 0, warnings: 0 };
+  const targetVersions = ONLY_VERSION ? versions.filter(v => v === ONLY_VERSION) : versions
+  if (ONLY_VERSION && !targetVersions.length) {
+    throw new Error(`Requested version '${ONLY_VERSION}' not found. Found: ${versions.join(', ')}`)
   }
 
-  let built = 0;
-  let skipped = 0;
-  let warnings = 0;
+  let totalBuilt = 0
+  let totalSkipped = 0
+  let totalWarnings = 0
 
-  for (const fname of jsonFiles) {
-    const srcPath = path.join(userFilamentDir, fname);
-
-    let userPreset;
-    try {
-      userPreset = readJson(srcPath);
-    } catch (e) {
-      console.log(`[base-fix] SKIP (bad JSON): ${fname}`);
-      skipped++;
-      continue;
-    }
-
-    // Heuristic: "truncated" user presets usually have base_id + inherits and relatively few keys,
-    // and "from" is User.
-    const fromVal =
-      userPreset && typeof userPreset.from === "string"
-        ? userPreset.from.trim().toLowerCase()
-        : "";
-
-    const looksLikeTruncatedUserPreset =
-      userPreset &&
-      typeof userPreset === "object" &&
-      fromVal === "user" &&
-      typeof userPreset.inherits === "string" &&
-      typeof userPreset.base_id === "string" &&
-      countKeys(userPreset) < 120;
-
-    if (!looksLikeTruncatedUserPreset) {
-      // Not what we expect to fix (or already expanded)
-      skipped++;
-      continue;
-    }
-
-    const outName = sanitizeFilename(fname);
-    const outPath = path.join(baseOutDir, outName);
-
-    if (isFile(outPath) && !FORCE) {
-      console.log(`[base-fix] SKIP (exists): ${outName}`);
-      skipped++;
-      continue;
-    }
-
-    const baseName = userPreset.inherits.trim();
-    const basePath = findSystemPresetPathByName(baseName, systemRoot);
-    if (!basePath) {
-      console.log(
-        `[base-fix] SKIP (missing base preset "${baseName}"): ${outName}`
-      );
-      skipped++;
-      continue;
-    }
-
-    let basePreset;
-    try {
-      basePreset = readJson(basePath);
-    } catch (e) {
-      console.log(`[base-fix] SKIP (bad base JSON "${baseName}"): ${outName}`);
-      skipped++;
-      continue;
-    }
-
-    // Root template (often fdm_filament_petg / pla / abs etc)
-    const rootName =
-      basePreset && typeof basePreset.inherits === "string"
-        ? basePreset.inherits.trim()
-        : null;
-
-    let rootPreset = {};
-    if (rootName) {
-      const rootPath = findSystemPresetPathByName(rootName, systemRoot);
-      if (!rootPath) {
-        console.log(
-          `[base-fix] WARN: Could not find root template "${rootName}" (continuing with base only)`
-        );
-        warnings++;
-      } else {
-        try {
-          rootPreset = readJson(rootPath);
-        } catch (e) {
-          console.log(
-            `[base-fix] WARN: Root template "${rootName}" is not valid JSON (continuing with base only)`
-          );
-          warnings++;
-          rootPreset = {};
-        }
-      }
-    }
-
-    // Normalize formats so we end up with the "array-of-strings" style that Filament-Sync expects.
-    const rootN = normalizePresetValues(rootPreset);
-    const baseN = normalizePresetValues(basePreset);
-    const userN = normalizePresetValues(userPreset);
-
-    // Merge order: root -> base -> user overrides
-    const merged = Object.assign({}, rootN, baseN, userN);
-
-    // Strongly suggest the "inherits" points to the root template after expansion.
-    // This is closer to what Creality Print tends to do for full presets.
-    if (rootName) merged.inherits = rootName;
-
-    // Ensure the preset has a name (prefer user preset name; else filename stem)
-    if (!merged.name || typeof merged.name !== "string") {
-      merged.name = path.basename(fname, ".json");
-    }
-
-    // Basic sanity: warn if still very small (likely means we didn't actually expand)
-    const finalKeyCount = countKeys(merged);
-    if (finalKeyCount < 120) {
-      console.log(
-        `[base-fix] WARN: Output still looks small (${finalKeyCount} keys): ${outName}`
-      );
-      warnings++;
-    }
-
-    // Write
-    try {
-      fs.writeFileSync(outPath, JSON.stringify(merged, null, 2), "utf8");
-      built++;
-      console.log(`[base-fix] WROTE: ${outName}  (${finalKeyCount} keys)`);
-    } catch (e) {
-      console.log(`[base-fix] SKIP (write failed): ${outName}`);
-      skipped++;
-      continue;
-    }
+  for (const v of targetVersions) {
+    const r = buildForVersion(crealityRoot, v)
+    totalBuilt += r.built
+    totalSkipped += r.skipped
+    totalWarnings += r.warnings
   }
 
-  console.log(
-    `[base-fix] Done for ${version}. Built ${built} base presets; skipped ${skipped}; warnings ${warnings}.\n`
-  );
-  return { built, skipped, warnings };
+  log(`ALL DONE. Total built: ${totalBuilt}; total skipped: ${totalSkipped}; total warnings: ${totalWarnings}.`)
+
+  if (totalWarnings > 0) {
+    log('NOTE: If you expected output, double-check:')
+    log(`  1) USERID in user-config.js is correct (${cfg.USERID || 'default'})`)
+    log('  2) Your custom presets exist under Creality Print: ...\\user\\<USERID>\\filament')
+    log('  3) The presets are truncated (short) and include base_id + inherits.')
+    log('  4) Your system preset exists under ...\\system\\ (searched recursively).')
+  }
 }
 
-// --- Entry point ---
-const versions = sortVersionsPrefer60First(listVersionDirs());
-
-if (versions.length === 0) {
-  console.error(
-    `[base-fix] ERROR: No Creality Print versions found under: ${CREALITY_ROOT}`
-  );
-  console.error(
-    `[base-fix] Expected something like: ...\\Creality Print\\6.0\\user\\${USERID}\\filament`
-  );
-  process.exit(1);
-}
-
-let totalBuilt = 0;
-let totalSkipped = 0;
-let totalWarnings = 0;
-
-for (const v of versions) {
-  const res = processCrealityVersion(v);
-  totalBuilt += res.built;
-  totalSkipped += res.skipped;
-  totalWarnings += res.warnings;
-}
-
-console.log(
-  `[base-fix] ALL DONE. Total built: ${totalBuilt}; total skipped: ${totalSkipped}; total warnings: ${totalWarnings}.`
-);
-
-if (totalBuilt === 0) {
-  console.log(
-    `[base-fix] NOTE: If you expected output, double-check:\n` +
-      `  1) USERID in user-config.js is correct (${USERID})\n` +
-      `  2) Your custom presets exist under Creality Print 6.0: ${path.join(
-        CREALITY_ROOT,
-        "6.0",
-        "user",
-        USERID,
-        "filament"
-      )}\n` +
-      `  3) The presets are "truncated" (short) and include base_id + inherits.\n` +
-      `  4) Re-run with --force if you already created base files and want to overwrite them.`
-  );
+try {
+  main()
+} catch (e) {
+  warn(e && e.message ? e.message : String(e))
+  process.exit(1)
 }

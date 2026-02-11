@@ -1,131 +1,246 @@
+// Filament-Sync/tools/scp.js
+//
+// Dropbear-friendly uploader: NO SFTP required.
+// Uploads files via SSH exec + stdin (cat > file), with atomic temp+mv.
+//
+// Compatible with BOTH config styles:
+//   - PRINTERIP / USER / PASSWORD  (as in Filament-Sync README)
+//   - PRINTER_IP / PRINTER_USER / PRINTER_PASSWORD (alt style)
+
 const fs = require('fs');
 const path = require('path');
+const { Client } = require('ssh2');
 
-const cfg = require('../user-config');
-const {
-  DEBUG,
-  dlog,
-  connectSSH,
-  exec,
-  readRemoteFile,
-  writeRemoteFileAtomic,
-} = require('./ssh-util');
+let cfg = {};
+try {
+  // user-config.js lives at repo root
+  cfg = require('../user-config');
+} catch {
+  cfg = {};
+}
 
-// Local project paths
-const PROJECT_ROOT = path.join(__dirname, '..');
-const DATA_DIR = path.join(PROJECT_ROOT, 'data');
-const BACKUP_DIR = path.join(PROJECT_ROOT, 'backups');
+// Optional debug logging: set FILAMENT_SYNC_DEBUG=1
+const DEBUG =
+  process.env.FILAMENT_SYNC_DEBUG === '1' ||
+  process.env.FILAMENT_SYNC_DEBUG === 'true';
 
-const nowStamp = () => {
-  const d = new Date();
-  const pad = (n) => String(n).padStart(2, '0');
-  return (
-    d.getFullYear() +
-    pad(d.getMonth() + 1) +
-    pad(d.getDate()) +
-    '_' +
-    pad(d.getHours()) +
-    pad(d.getMinutes()) +
-    pad(d.getSeconds())
-  );
+const log = (...args) => console.log('[Filament-Sync][upload]', ...args);
+const dlog = (...args) => {
+  if (DEBUG) log(...args);
 };
 
-const getPrinterConfig = () => {
-  // Support both upstream name (PRINTERIP) and our preferred PRINTER_IP
-  const host = cfg.PRINTER_IP || cfg.PRINTERIP || cfg.HOST || cfg.HOSTNAME;
-  const port = Number(cfg.PORT || 22);
-  const username = cfg.USER || 'root';
-  const password = cfg.PASSWORD;
-
-  // Default to the service watch folder.
-  const remoteDir = cfg.REMOTE_SYNC_DIR || '/usr/share/Filament-Sync';
-
-  if (!host) {
-    throw new Error(
-      'Missing printer host/IP. Set PRINTER_IP (recommended) or PRINTERIP in user-config.js'
-    );
+const pickFirst = (...vals) => {
+  for (const v of vals) {
+    if (typeof v === 'string' && v.trim() !== '') return v.trim();
+    if (typeof v === 'number' && Number.isFinite(v)) return String(v);
   }
-  if (!password) {
-    throw new Error('Missing printer password. Set PASSWORD in user-config.js');
-  }
+  return '';
+};
+
+const shQuote = (s) => {
+  // Strong single-quote escaping for sh.
+  // ' -> '\''  (close quote, escape, reopen)
+  return `'${String(s).replace(/'/g, `'\\''`)}'`;
+};
+
+const getPrinterParams = () => {
+  const host = pickFirst(
+    process.env.PRINTER_IP,
+    process.env.PRINTERIP,
+    cfg.PRINTER_IP,
+    cfg.PRINTERIP,
+    cfg.PRINTER_HOST,
+    cfg.PRINTERHOST,
+    cfg.PRINTER
+  );
+
+  const username = pickFirst(
+    process.env.PRINTER_USER,
+    process.env.PRINTERUSER,
+    cfg.PRINTER_USER,
+    cfg.USER,
+    cfg.USERNAME
+  ) || 'root';
+
+  const password = pickFirst(
+    process.env.PRINTER_PASSWORD,
+    process.env.PRINTERPASS,
+    cfg.PRINTER_PASSWORD,
+    cfg.PASSWORD,
+    cfg.PASS
+  );
+
+  const portStr = pickFirst(
+    process.env.PRINTER_PORT,
+    cfg.PRINTER_PORT,
+    cfg.PORT
+  );
+  const port = portStr ? Number(portStr) : 22;
+
+  // Where Filament-Sync-Service watches on the printer
+  const remoteDir = pickFirst(
+    process.env.PRINTER_SYNC_DIR,
+    process.env.REMOTE_DIR,
+    cfg.PRINTER_SYNC_DIR,
+    cfg.REMOTE_DIR,
+    cfg.SYNCDIRECTORY
+  ) || '/usr/share/Filament-Sync';
 
   return { host, port, username, password, remoteDir };
 };
 
-const ensureLocalDir = (dir) => {
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+const connectSSH = ({ host, port, username, password }) => {
+  return new Promise((resolve, reject) => {
+    const conn = new Client();
+
+    conn
+      .on('ready', () => resolve(conn))
+      .on('error', (err) => reject(err))
+      .connect({
+        host,
+        port: port || 22,
+        username,
+        password,
+        // Dropbear can be picky; keepalive helps stability on some networks
+        keepaliveInterval: 15000,
+        keepaliveCountMax: 3,
+        readyTimeout: 20000,
+      });
+  });
 };
 
-const backupRemoteFiles = async (conn, remoteDir, filenames) => {
-  const doBackup =
-    process.env.FILAMENT_SYNC_BACKUP !== '0' &&
-    process.env.FILAMENT_SYNC_BACKUP !== 'false';
+const execWithStdin = (conn, command, stdinBuffer) => {
+  return new Promise((resolve, reject) => {
+    dlog('exec:', command);
 
-  if (!doBackup) return;
+    conn.exec(command, (err, stream) => {
+      if (err) return reject(err);
 
-  ensureLocalDir(BACKUP_DIR);
-  const stamp = nowStamp();
-  const outDir = path.join(BACKUP_DIR, stamp);
-  ensureLocalDir(outDir);
+      let stdout = '';
+      let stderr = '';
 
-  for (const name of filenames) {
-    const remotePath = `${remoteDir}/${name}`;
-    try {
-      const content = await readRemoteFile(conn, remotePath);
-      const localPath = path.join(outDir, name);
-      fs.writeFileSync(localPath, content, 'utf8');
-      if (DEBUG) dlog(`backup: saved ${remotePath} -> ${localPath}`);
-    } catch (e) {
-      // Remote file may not exist yet; that's fine.
-      if (DEBUG) dlog(`backup: skip ${remotePath} (${e.message.split('\n')[0]})`);
-    }
+      stream.on('data', (d) => (stdout += d.toString()));
+      stream.stderr.on('data', (d) => (stderr += d.toString()));
+
+      stream.on('close', (code, signal) => {
+        if (code === 0) {
+          return resolve({ stdout, stderr, code, signal });
+        }
+        const e = new Error(
+          `Remote command failed (exit ${code}${signal ? `, signal ${signal}` : ''}).\n` +
+          `CMD: ${command}\n` +
+          (stderr ? `STDERR:\n${stderr}\n` : '') +
+          (stdout ? `STDOUT:\n${stdout}\n` : '')
+        );
+        reject(e);
+      });
+
+      if (stdinBuffer && stdinBuffer.length) {
+        stream.end(stdinBuffer);
+      } else {
+        stream.end();
+      }
+    });
+  });
+};
+
+const uploadBufferAtomic = async (conn, buffer, remotePath) => {
+  const remoteDir = path.posix.dirname(remotePath);
+  const tmpPath = `${remotePath}.tmp`;
+
+  // Use a shell script so we can:
+  //  - ensure dir exists
+  //  - write to tmp via stdin
+  //  - mv into place atomically
+  const script =
+    `set -e; ` +
+    `umask 022; ` +
+    `mkdir -p ${shQuote(remoteDir)}; ` +
+    `cat > ${shQuote(tmpPath)}; ` +
+    `mv -f ${shQuote(tmpPath)} ${shQuote(remotePath)};`;
+
+  const cmd = `sh -lc ${shQuote(script)}`;
+
+  await execWithStdin(conn, cmd, buffer);
+
+  // Optional verification: show remote size
+  const verifyCmd = `sh -lc ${shQuote(`ls -l ${shQuote(remotePath)} || true`)}`;
+  const { stdout } = await execWithStdin(conn, verifyCmd);
+  dlog('verify:', stdout.trim());
+};
+
+const sendFiles = async (files, opts = {}) => {
+  const p = getPrinterParams();
+
+  // Validate here (NOT at require-time)
+  if (!p.host) {
+    throw new Error(
+      `Missing printer host/IP.\n` +
+      `Set PRINTERIP in user-config.js (recommended, per README), or set PRINTER_IP.\n` +
+      `Example user-config.js fields:\n` +
+      `  PRINTERIP: '192.168.x.x', USER: 'root', PASSWORD: 'yourpass'\n`
+    );
   }
-};
+  if (!p.password) {
+    throw new Error(
+      `Missing printer password.\n` +
+      `Set PASSWORD in user-config.js (recommended), or set PRINTER_PASSWORD.\n`
+    );
+  }
 
-const uploadFiles = async ({ remoteDir }) => {
-  ensureLocalDir(DATA_DIR);
+  log(`Connecting to ${p.username}@${p.host}:${p.port || 22} ...`);
 
-  const filenames = ['material_database.json', 'material_option.json'];
-
-  const { host, port, username, password } = getPrinterConfig();
-
-  dlog(`Connecting to ${username}@${host}:${port} ...`);
-
-  const conn = await connectSSH({ host, port, username, password });
-
+  const conn = await connectSSH(p);
   try {
-    // Ensure remote dir exists
-    dlog(`exec: mkdir -p ${remoteDir}`);
-    await exec(conn, `mkdir -p '${remoteDir.replace(/'/g, "'\\''")}'`);
+    // Ensure base dir exists
+    await execWithStdin(conn, `sh -lc ${shQuote(`mkdir -p ${shQuote(p.remoteDir)}`)}`);
 
-    // Backup current remote copies (optional)
-    await backupRemoteFiles(conn, remoteDir, filenames);
-
-    // Upload
-    for (const name of filenames) {
-      const localPath = path.join(DATA_DIR, name);
-      const remotePath = `${remoteDir}/${name}`;
+    for (const f of files) {
+      const localPath = f.local;
+      const remotePath = f.remote;
 
       if (!fs.existsSync(localPath)) {
-        throw new Error(`Local file missing: ${localPath}\nDid main.js generate it?`);
+        throw new Error(`Local file not found: ${localPath}`);
       }
 
-      const data = fs.readFileSync(localPath);
-      dlog(`Uploading ${name} (${data.length} bytes) -> ${remotePath}`);
-      await writeRemoteFileAtomic(conn, remotePath, data);
+      const buf = fs.readFileSync(localPath);
+      log(`Uploading ${path.basename(localPath)} (${buf.length} bytes) -> ${remotePath}`);
 
-      const verify = await exec(conn, `ls -l '${remotePath.replace(/'/g, "'\\''")}' || true`);
-      if (DEBUG) dlog('verify:', (verify.stdout || verify.stderr || '').trim());
+      await uploadBufferAtomic(conn, buf, remotePath);
     }
 
-    dlog('Upload complete.');
+    log('Upload complete.');
   } finally {
     conn.end();
   }
 };
 
-// Upstream compatibility: main.js expects require('./tools/scp.js') to be callable.
-const sendFiles = async () => uploadFiles(getPrinterConfig());
+const sendToPrinterAsync = async () => {
+  const p = getPrinterParams();
 
-module.exports = sendFiles;
+  const dataDir = path.join(__dirname, '..', 'data');
+  const dbLocal = path.join(dataDir, 'material_database.json');
+  const optLocal = path.join(dataDir, 'material_option.json');
+
+  const dbRemote = `${p.remoteDir}/material_database.json`;
+  const optRemote = `${p.remoteDir}/material_option.json`;
+
+  await sendFiles([
+    { local: dbLocal, remote: dbRemote },
+    { local: optLocal, remote: optRemote },
+  ]);
+};
+
+// Export as a callable function (matches your main.js)
+function sendToPrinter() {
+  // IMPORTANT: main.js does not await, so we catch here to avoid unhandled rejections.
+  sendToPrinterAsync().catch((err) => {
+    console.error('[Filament-Sync][upload] FAILED:\n' + (err?.stack || err));
+    process.exitCode = 1;
+  });
+}
+
+// Hybrid exports: callable + properties
+module.exports = sendToPrinter;
+module.exports.sendToPrinter = sendToPrinter;
 module.exports.sendFiles = sendFiles;

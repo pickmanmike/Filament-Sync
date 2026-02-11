@@ -1,26 +1,27 @@
-const { initData, readProfiles } = require('./tools/config.js');
-const database = require('./tools/database-tool.js');
-const options = require('./tools/options-tool.js');
-const sendToPrinter = require('./tools/scp.js');
+const { initData, readProfiles, sendToPrinter } = require('./tools/config.js')
+const { updateMaterialDatabase } = require('./tools/database-tool.js')
+const { updateMaterialOptions } = require('./tools/options-tool.js')
+const { installService } = require('./tools/service-installer.js')
 
-// Entrypoint
-(async () => {
+;(async () => {
   try {
-    initData();
+    // 1) Ensure ./data exists + seed from ./tools/sourcedata
+    initData()
 
-    const profiles = readProfiles();
+    // 2) Read local slicer presets (Creality Print or Orca)
+    const profiles = readProfiles()
 
-    // Build the two files Creality actually consumes
-    await options.addToOptions(profiles);
-    await database.addToDatabase(profiles);
+    // 3) Update JSON files in ./data
+    updateMaterialDatabase(profiles)
+    updateMaterialOptions(profiles)
 
-    // Upload to printer (Creality Hi: no SFTP server, so we use pure SSH exec + cat)
-    await sendToPrinter();
+    // 4) Ensure printer-side service is present (no-op if already installed)
+    await installService()
+
+    // 5) Upload DB/OPT to the printer
+    await sendToPrinter()
   } catch (err) {
-    console.error('\n[Filament-Sync] ERROR:', err?.message || err);
-    if (process.env.FILAMENT_SYNC_DEBUG) {
-      console.error(err);
-    }
-    process.exit(1);
+    console.error(err && err.stack ? err.stack : err)
+    process.exitCode = 1
   }
-})();
+})()

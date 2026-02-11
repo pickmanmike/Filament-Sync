@@ -1,194 +1,166 @@
+// Tools for material database (safe / idempotent upsert version)
 const fs = require('fs');
 const path = require('path');
 
-const { PRINTER_DB_PATH, REMOTE_BOX_DIR } = require('../user-config');
-const cfg = require('../user-config');
+const dataDir = path.join(__dirname, '..', 'data');
+const databaseFile = path.join(dataDir, 'material_database.json');
 
-const newMaterialTemplate = require('./sourcedata/newMaterial.json');
+const { readProfiles } = require('./config');
+const convertToPrinterFormat = require('./jsonhandler.js');
 
-const { connectSSH, readRemoteFile } = require('./ssh-util');
-
+// Optional debug logging: set FILAMENT_SYNC_DEBUG=1
 const DEBUG =
   process.env.FILAMENT_SYNC_DEBUG === '1' ||
   process.env.FILAMENT_SYNC_DEBUG === 'true';
 
-const log = (...args) => console.log('[Filament-Sync][db]', ...args);
 const dlog = (...args) => {
-  if (DEBUG) log(...args);
+  if (DEBUG) console.log('[Filament-Sync][db]', ...args);
 };
 
-const PROJECT_ROOT = path.join(__dirname, '..');
-const DATA_DIR = path.join(PROJECT_ROOT, 'data');
-
-const ensureDataDir = () => {
-  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-};
-
-const unwrapFirst = (v) => (Array.isArray(v) ? v[0] : v);
-
-const getNotesString = (profile) => {
-  const n = profile?.filament_notes;
-  if (Array.isArray(n)) return String(n[0] ?? '');
-  if (typeof n === 'string') return n;
-  return '';
-};
-
-const parseNotes = (profile) => {
-  const raw = (getNotesString(profile) || '').trim();
-  if (!raw || raw === '""') return null;
+const readJson = (filePath) => {
   try {
+    const raw = fs.readFileSync(filePath, 'utf8');
     return JSON.parse(raw);
-  } catch {
-    return null;
-  }
-};
-
-const nowEpochSeconds = () => String(Math.floor(Date.now() / 1000));
-
-const getPrinterConfig = () => {
-  const host = cfg.PRINTER_IP || cfg.PRINTERIP || cfg.HOST || cfg.HOSTNAME;
-  const port = Number(cfg.PORT || 22);
-  const username = cfg.USER || 'root';
-  const password = cfg.PASSWORD;
-
-  if (!host || !password) return null;
-  return { host, port, username, password };
-};
-
-const resolveRemotePaths = () => {
-  const boxDir = cfg.REMOTE_BOX_DIR || '/mnt/UDISK/creality/userdata/box';
-  const dbPath = cfg.PRINTER_DB_PATH || `${boxDir}/material_database.json`;
-  return { boxDir, dbPath };
-};
-
-const loadJsonFile = (filePath) => {
-  const raw = fs.readFileSync(filePath, 'utf8');
-  return JSON.parse(raw);
-};
-
-const loadBaseDatabase = async () => {
-  // 1) Prefer reading the current DB off the printer (preserves OEM changes)
-  const sshCfg = getPrinterConfig();
-  const { dbPath } = resolveRemotePaths();
-  if (sshCfg) {
-    try {
-      const conn = await connectSSH(sshCfg);
-      try {
-        const raw = await readRemoteFile(conn, dbPath);
-        const json = JSON.parse(raw);
-        dlog(`Loaded base DB from printer: ${dbPath}`);
-        return json;
-      } finally {
-        conn.end();
-      }
-    } catch (e) {
-      dlog(`WARN: couldn't read base DB from printer (${e.message.split('\n')[0]}). Falling back.`);
-    }
-  }
-
-  // 2) Fall back to repo sourcedata (works offline, but may get stale)
-  const fallbackPath = path.join(__dirname, 'sourcedata', 'material_database.json');
-  const json = loadJsonFile(fallbackPath);
-  dlog(`Loaded base DB from repo: ${fallbackPath}`);
-  return json;
-};
-
-const getList = (dbObj) => {
-  const list = dbObj?.result?.list;
-  if (!Array.isArray(list)) {
+  } catch (err) {
     throw new Error(
-      'Unexpected material_database.json shape: expected obj.result.list to be an array.'
+      `Failed to read/parse JSON: ${filePath}\n` +
+      `Error: ${err?.message || err}\n\n` +
+      `This usually means material_database.json is not the real/full database file.\n` +
+      `Make sure tools/sourcedata/material_database.json is the full file (tens of KB+), NOT the tiny .tmp-style metadata.`
     );
   }
-  return list;
 };
 
-const findById = (list, id) => {
-  return list.findIndex((m) => String(unwrapFirst(m?.id) ?? '') === String(id));
+const writeJson = (filePath, obj) => {
+  fs.writeFileSync(filePath, JSON.stringify(obj, null, '\t'));
 };
 
-const deepClone = (obj) => JSON.parse(JSON.stringify(obj));
-
-const normalizeToArray = (v) => {
-  if (Array.isArray(v)) return v;
-  if (v === null || v === undefined) return v;
-  // Keep objects as-is (rare in Creality exports)
-  if (typeof v === 'object') return v;
-  return [v];
+const normalizeId = (id) => {
+  if (id === null || id === undefined) return '';
+  return String(id).trim();
 };
 
-const buildMaterialFromProfile = (profile, notesObj) => {
-  const mat = deepClone(newMaterialTemplate);
+const ensureDbShape = (db) => {
+  if (!db || typeof db !== 'object') {
+    throw new Error('material_database.json is not an object.');
+  }
+  if (!db.result || typeof db.result !== 'object') db.result = {};
 
-  // Copy all profile keys first (so our identity fields override afterwards)
-  for (const [k, v] of Object.entries(profile || {})) {
-    mat[k] = normalizeToArray(v);
+  // The printer DB is expected to have result.list (array)
+  if (!Array.isArray(db.result.list)) db.result.list = [];
+
+  // Keep count consistent with list length
+  if (typeof db.result.count !== 'number') db.result.count = db.result.list.length;
+
+  // Keep version as a string if present; we'll update it on write
+  if (db.result.version === undefined || db.result.version === null) {
+    db.result.version = String(Math.floor(Date.now() / 1000));
+  } else {
+    db.result.version = String(db.result.version);
   }
 
-  // Required identity fields (what the printer UI actually keys on)
-  const id = String(notesObj.id);
-  const name = String(notesObj.name);
-  const vendor = String(notesObj.vendor);
-  const type = String(notesObj.type);
-
-  mat.id = [id];
-  mat.name = [name];
-  mat.filament_id = [id];
-  mat.filament_vendor = [vendor];
-  mat.filament_type = [type];
-  mat.filament_settings_id = [name];
-  mat.from = ['User'];
-  mat.is_custom_defined = [0];
-  mat.filament_notes = [JSON.stringify({ id, vendor, type, name })];
-
-  return mat;
+  return db;
 };
 
-const addToDatabase = async (profiles) => {
-  ensureDataDir();
-
-  const dbObj = await loadBaseDatabase();
-  const list = getList(dbObj);
-  const startingCount = Number(dbObj?.result?.count ?? list.length);
-
-  log(`Starting DB list length: ${list.length} (count=${startingCount})`);
-  log(`Profiles to apply: ${profiles.length}`);
-
-  let added = 0;
-  let updated = 0;
-
-  for (const p of profiles) {
-    const notesObj = parseNotes(p);
-    if (!notesObj || !notesObj.id) {
-      log('SKIP: profile missing/invalid filament_notes:', unwrapFirst(p?.name) || '(unnamed)');
-      continue;
-    }
-
-    const id = String(notesObj.id);
-    const idx = findById(list, id);
-    const material = buildMaterialFromProfile(p, notesObj);
-
-    if (idx >= 0) {
-      list[idx] = material;
-      updated += 1;
-      dlog(`UPDATED material id=${id} name=${notesObj.name}`);
-    } else {
-      list.push(material);
-      added += 1;
-      dlog(`ADDED material id=${id} name=${notesObj.name}`);
-    }
+// Normalize the converted "material" object into what the printer DB expects.
+// The original Filament-Sync logic treated:
+//   - material.base.id as the *custom ID* (from filament_notes.id)
+//   - material.base_id as the *system base preset id* (e.g., GFSA04)
+// ...then rewired fields accordingly.
+const normalizeConvertedMaterial = (converted, presetNameForErrors) => {
+  if (!converted || typeof converted !== 'object') {
+    throw new Error(`convertToPrinterFormat returned nothing for preset: ${presetNameForErrors}`);
   }
 
-  dbObj.result.count = list.length;
-  dbObj.result.version = nowEpochSeconds();
+  // Clone to avoid side-effects leaking across runs
+  const material = JSON.parse(JSON.stringify(converted));
 
-  log(
-    `Ending DB list length: ${list.length} (count=${dbObj.result.count}, version=${dbObj.result.version})`
-  );
-  if (DEBUG) log(`Added: ${added}, Updated: ${updated}`);
+  if (!material.base || typeof material.base !== 'object') material.base = {};
 
-  const outPath = path.join(DATA_DIR, 'material_database.json');
-  fs.writeFileSync(outPath, JSON.stringify(dbObj, null, '\t'));
+  // Prefer explicit id, else fall back to base.id (older behavior)
+  const customId = normalizeId(material.id || material.base.id);
+  if (!customId) {
+    throw new Error(
+      `Converted material is missing a custom id (id/base.id). Preset: ${presetNameForErrors}`
+    );
+  }
+
+  // If base_id exists, use it as base.id and delete base_id
+  const baseId = material.base_id !== undefined ? normalizeId(material.base_id) : '';
+  material.id = customId;
+
+  if (baseId) {
+    material.base.id = baseId;
+    delete material.base_id;
+  }
+
+  // Many entries appear to require base.is_system; keep consistent with original intent
+  if (material.base.is_system === undefined) material.base.is_system = true;
+
+  return material;
 };
 
-module.exports = { addToDatabase };
+const upsertByMaterialId = (list, material) => {
+  const id = normalizeId(material.id);
+  const idx = list.findIndex((m) => normalizeId(m && m.id) === id);
+
+  if (idx >= 0) {
+    list[idx] = material;
+    return { updated: true, index: idx };
+  } else {
+    list.push(material);
+    return { updated: false, index: list.length - 1 };
+  }
+};
+
+const addProfiles = () => {
+  // Basic sanity: data folder must exist
+  if (!fs.existsSync(dataDir)) {
+    throw new Error(`Data directory not found: ${dataDir}\nRun initData first.`);
+  }
+  if (!fs.existsSync(databaseFile)) {
+    throw new Error(`material_database.json not found: ${databaseFile}\nRun initData first.`);
+  }
+
+  const db = ensureDbShape(readJson(databaseFile));
+  const beforeLen = db.result.list.length;
+
+  const presets = readProfiles();
+  dlog(`Starting DB list length: ${beforeLen} (count=${db.result.count})`);
+  dlog(`Profiles to apply: ${Array.isArray(presets) ? presets.length : 0}`);
+
+  for (const p of presets) {
+    const presetName =
+      (Array.isArray(p?.name) ? p.name[0] : p?.name) ||
+      p?.name ||
+      'UnknownPreset';
+
+    const converted = convertToPrinterFormat(p);
+    const material = normalizeConvertedMaterial(converted, presetName);
+
+    const { updated } = upsertByMaterialId(db.result.list, material);
+
+    dlog(`${updated ? 'UPDATED' : 'ADDED'} material id=${material.id} name=${material.name || ''}`);
+  }
+
+  // Always keep count in sync with list length
+  db.result.count = db.result.list.length;
+
+  // Bump version so the consumer has a reason to reload (string epoch seconds)
+  db.result.version = String(Math.floor(Date.now() / 1000));
+
+  writeJson(databaseFile, db);
+
+  const afterLen = db.result.list.length;
+  dlog(`Ending DB list length: ${afterLen} (count=${db.result.count}, version=${db.result.version})`);
+
+  // Guard rail: if we ever shrink massively, something is wrong
+  if (afterLen < beforeLen) {
+    throw new Error(
+      `material_database list SHRANK from ${beforeLen} to ${afterLen}. Refusing to proceed.\n` +
+      `This indicates a logic or input-file problem. Restore backups before continuing.`
+    );
+  }
+};
+
+module.exports = addProfiles;
